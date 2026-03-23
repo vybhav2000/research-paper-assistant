@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-paper-assistant"
+version = "0.1.0"
+description = "Research paper assistant with PDF viewing, highlighting, memory, and OpenAI-backed Q&A"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "langchain-openai>=0.3.17",
+    "langgraph>=0.4.5",
+    "openai>=1.68.0",
+    "pypdf>=5.4.0",
+    "python-dotenv>=1.0.1",
+    "sqlalchemy>=2.0.39",
+    "uvicorn>=0.34.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.1",
+    "ruff>=0.15.7",
+]
