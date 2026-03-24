@@ -6,8 +6,11 @@
   <title>Research Paper Assistant</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=Sora:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
   <link rel="stylesheet" href="/static/style.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
 </head>
 <body>
   <div class="app-shell">
@@ -32,7 +35,10 @@
       <section class="library-card">
         <div class="section-head">
           <h2>Library</h2>
-          <span id="paper-count" class="pill">0 papers</span>
+          <div class="section-actions">
+            <span id="paper-count" class="pill">0 papers</span>
+            <button id="clear-library" class="ghost-btn danger-btn" type="button">Clear library</button>
+          </div>
         </div>
         <div id="paper-list" class="paper-list"></div>
       </section>
@@ -51,22 +57,34 @@
         <div class="hero-copy">
           <p class="eyebrow">Research Workspace</p>
           <h2>Read, retain, and question papers in one place.</h2>
-          <p>Bring in a title or arXiv link, open the paper instantly, and work through it with memory-aware chat.</p>
+          <p>Bring in a title or arXiv link, open the paper instantly, generate a full markdown summary, and work through it with an agentic paper assistant.</p>
           <div class="hero-metrics">
             <div class="hero-metric">
               <span class="hero-metric-value">PDF</span>
-              <span class="hero-metric-label">Native viewer</span>
+              <span class="hero-metric-label">Native reading surface</span>
             </div>
             <div class="hero-metric">
-              <span class="hero-metric-value">RAG</span>
-              <span class="hero-metric-label">Grounded answers</span>
+              <span class="hero-metric-value">Agent</span>
+              <span class="hero-metric-label">Tool-using follow-ups</span>
             </div>
             <div class="hero-metric">
-              <span class="hero-metric-value">Memory</span>
-              <span class="hero-metric-label">Saved highlights</span>
+              <span class="hero-metric-value">MD</span>
+              <span class="hero-metric-label">Full paper summary</span>
             </div>
           </div>
         </div>
+        <aside class="hero-aside">
+          <div class="hero-card">
+            <p class="card-label">Workflow</p>
+            <h3>Import, summarize, interrogate.</h3>
+            <p>Each paper becomes a browsable workspace with cached markdown summary, PDF context retrieval, and highlight-driven agentic chat.</p>
+            <div class="stack-row">
+              <span class="metric-chip">arXiv import</span>
+              <span class="metric-chip">summary cache</span>
+              <span class="metric-chip">Tavily fallback</span>
+            </div>
+          </div>
+        </aside>
       </section>
 
       <section class="paper-meta hidden" id="paper-meta"></section>
@@ -87,17 +105,23 @@
         <div class="chat-column">
           <div class="panel chat-panel">
             <div class="section-head">
-              <h3>Paper Chat</h3>
+              <h3>Agentic Chat</h3>
               <div class="chat-toolbar">
-                <span id="chat-mode" class="pill">Whole paper</span>
-                <select id="chat-engine" class="mode-select" aria-label="Chat mode">
-                  <option value="standard">Standard</option>
-                  <option value="agentic">Agentic</option>
-                </select>
+                <span id="chat-mode" class="pill">Whole paper | Agentic</span>
                 <button id="clear-chat" class="ghost-btn" type="button">Clear Chat</button>
               </div>
             </div>
-            <p class="panel-caption">Ask for explanations, limitations, comparisons, or use a saved highlight as focus.</p>
+            <p class="panel-caption">Start with the PDF summary, then ask for explanations, limitations, comparisons, or use a saved highlight as focus.</p>
+            <section id="summary-panel" class="summary-panel">
+              <div class="agent-panel-head">
+                <strong>PDF Summary</strong>
+                <div class="section-actions">
+                  <span id="summary-status" class="pill subtle">Not created</span>
+                  <button id="create-summary" class="ghost-btn" type="button">Create summary</button>
+                </div>
+              </div>
+              <div id="paper-summary" class="markdown-body summary-body"></div>
+            </section>
             <div id="agent-panel" class="agent-panel hidden">
               <div class="agent-panel-head">
                 <strong>Agent Activity</strong>
@@ -109,7 +133,7 @@
             <form id="chat-form" class="chat-form">
               <textarea id="chat-input" rows="4" placeholder="Ask about methods, assumptions, results, limitations, or use a saved highlight as chat focus."></textarea>
               <div class="chat-actions">
-                <p class="muted mono">Answers cite supporting chunks from the paper.</p>
+                <p class="muted mono">Answers are agentic markdown grounded in the paper, with Tavily search only when needed.</p>
                 <button type="submit">Send</button>
               </div>
             </form>

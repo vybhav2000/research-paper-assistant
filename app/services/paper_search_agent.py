@@ -18,6 +18,15 @@ from app.schemas import ParsedPaper
 logger = get_logger("app.agent.paper_search")
 
 
+def _normalize_search_query(query: str) -> str:
+    cleaned = " ".join(query.strip().split())
+    lowered = cleaned.lower()
+    prefixes = ("all:", "ti:", "au:", "abs:", "cat:")
+    if lowered.startswith(prefixes):
+        return cleaned.split(":", 1)[1].strip().strip('"')
+    return cleaned.strip('"')
+
+
 def _entry_to_candidate(entry: ElementTree.Element, namespace: dict[str, str]) -> dict[str, Any]:
     title = (entry.findtext("atom:title", default="", namespaces=namespace) or "").strip()
     abstract = (entry.findtext("atom:summary", default="", namespaces=namespace) or "").strip()
@@ -43,9 +52,11 @@ def _entry_to_candidate(entry: ElementTree.Element, namespace: dict[str, str]) -
 
 
 def _search_candidates(query: str, max_results: int = 6) -> list[dict[str, Any]]:
+    normalized_query = _normalize_search_query(query)
     search_queries = [
-        {"search_query": f'ti:"{query}"', "start": 0, "max_results": max_results},
-        {"search_query": f"all:{query}", "start": 0, "max_results": max_results},
+        {"search_query": f'ti:"{normalized_query}"', "start": 0, "max_results": max_results},
+        {"search_query": f'all:"{normalized_query}"', "start": 0, "max_results": max_results},
+        {"search_query": normalized_query, "start": 0, "max_results": max_results},
     ]
     namespace = {"atom": "http://www.w3.org/2005/Atom"}
     deduped: dict[str, dict[str, Any]] = {}
@@ -53,7 +64,14 @@ def _search_candidates(query: str, max_results: int = 6) -> list[dict[str, Any]]
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         for params in search_queries:
             response = client.get(ARXIV_API, params=params)
-            response.raise_for_status()
+            if response.status_code >= 400:
+                logger.warning(
+                    "paper_search_query_failed | query=%s | search_query=%s | status=%s",
+                    query,
+                    params["search_query"],
+                    response.status_code,
+                )
+                continue
             xml_root = ElementTree.fromstring(response.text)
             for entry in xml_root.findall("atom:entry", namespace):
                 candidate = _entry_to_candidate(entry, namespace)
@@ -88,18 +106,27 @@ def search_arxiv_with_agent(query: str) -> ParsedPaper:
         candidates = _search_candidates(query_text)
         for candidate in candidates:
             seen_candidates[candidate["source_url"]] = candidate
-        logger.info("paper_search_tool_result | tool=search_arxiv | query=%s | candidates=%s", query_text, len(candidates))
+        logger.info(
+            "paper_search_tool_result | tool=search_arxiv | query=%s | candidates=%s",
+            query_text,
+            len(candidates),
+        )
         return json.dumps(candidates)
 
     @tool
     def get_candidate_by_url(source_url: str) -> str:
         """Fetch a previously seen candidate by its source_url so you can confirm the exact final selection."""
-        logger.info("paper_search_tool_call | tool=get_candidate_by_url | source_url=%s", source_url)
+        logger.info(
+            "paper_search_tool_call | tool=get_candidate_by_url | source_url=%s", source_url
+        )
         candidate = seen_candidates.get(source_url)
         if candidate is None:
             logger.info("paper_search_tool_result | tool=get_candidate_by_url | found=false")
             return json.dumps({"found": False, "source_url": source_url})
-        logger.info("paper_search_tool_result | tool=get_candidate_by_url | found=true | title=%s", candidate["title"])
+        logger.info(
+            "paper_search_tool_result | tool=get_candidate_by_url | found=true | title=%s",
+            candidate["title"],
+        )
         return json.dumps({"found": True, "candidate": candidate})
 
     model = ChatOpenAI(
@@ -128,20 +155,33 @@ def search_arxiv_with_agent(query: str) -> ParsedPaper:
         message_type = getattr(message, "type", message.__class__.__name__)
         content = getattr(message, "content", "")
         preview = content if isinstance(content, str) else json.dumps(content)
-        logger.info("paper_search_agent_message | type=%s | content=%s", message_type, preview[:1200])
+        logger.info(
+            "paper_search_agent_message | type=%s | content=%s", message_type, preview[:1200]
+        )
     final_payload = _extract_final_json(result["messages"])
     if not final_payload.get("match_found"):
         reason = final_payload.get("reason") or "No confident paper match was found."
         logger.warning("paper_search_agent_no_match | query=%s | reason=%s", query, reason)
-        raise HTTPException(status_code=404, detail=f"{reason} Try a more exact title or a direct arXiv URL.")
-
+        raise HTTPException(
+            status_code=404, detail=f"{reason} Try a more exact title or a direct arXiv URL."
+        )
     source_url = final_payload.get("source_url", "").strip()
     candidate = seen_candidates.get(source_url)
     if not candidate:
-        logger.error("paper_search_agent_invalid_selection | query=%s | source_url=%s", query, source_url)
-        raise HTTPException(status_code=500, detail="Search agent selected a paper that was not present in tool results.")
+        logger.error(
+            "paper_search_agent_invalid_selection | query=%s | source_url=%s", query, source_url
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Search agent selected a paper that was not present in tool results.",
+        )
 
-    logger.info("paper_search_agent_complete | query=%s | title=%s | source_url=%s", query, candidate["title"], candidate["source_url"])
+    logger.info(
+        "paper_search_agent_complete | query=%s | title=%s | source_url=%s",
+        query,
+        candidate["title"],
+        candidate["source_url"],
+    )
     return ParsedPaper(
         title=candidate["title"],
         authors=candidate["authors"],

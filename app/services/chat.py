@@ -11,7 +11,14 @@ from app.config import get_settings
 from app.db import get_db
 from app.models import Paper, PaperChunk
 from app.openai_client import get_openai_client
-from app.repositories import fetch_chunks, fetch_recent_messages, get_conversation_id, store_message, summarize_highlights
+from app.repositories import (
+    fetch_chunks,
+    fetch_recent_messages,
+    get_conversation_id,
+    store_message,
+    summarize_highlights,
+)
+from app.services.vector_store import search_vector_index
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -33,8 +40,26 @@ def row_to_chunk(row: PaperChunk) -> dict[str, Any]:
     }
 
 
-def retrieve_relevant_chunks(paper_id: str, message: str, selected_chunk_ids: list[str], top_k: int = 6) -> list[dict[str, Any]]:
+def retrieve_relevant_chunks(
+    paper_id: str, message: str, selected_chunk_ids: list[str], top_k: int = 6
+) -> list[dict[str, Any]]:
     client = get_openai_client()
+    query_embedding = (
+        client.embeddings.create(model=get_settings().embedding_model, input=[message])
+        .data[0]
+        .embedding
+    )
+
+    vector_results = search_vector_index(paper_id, query_embedding, top_k=top_k * 2)
+    if vector_results is not None:
+        selected_set = set(selected_chunk_ids)
+        selected_chunks = [chunk for chunk in vector_results if chunk["id"] in selected_set]
+        non_selected_chunks = [chunk for chunk in vector_results if chunk["id"] not in selected_set]
+        merged = selected_chunks[:top_k]
+        merged.extend(non_selected_chunks[: max(0, top_k - len(merged))])
+        if merged:
+            return merged[:top_k]
+
     with get_db() as connection:
         chunks = fetch_chunks(connection, paper_id)
 
@@ -43,8 +68,6 @@ def retrieve_relevant_chunks(paper_id: str, message: str, selected_chunk_ids: li
     non_selected_chunks = [chunk for chunk in chunks if chunk.id not in selected_set]
     if selected_chunks and len(selected_chunks) >= top_k:
         return [row_to_chunk(chunk) for chunk in selected_chunks[:top_k]]
-
-    query_embedding = client.embeddings.create(model=get_settings().embedding_model, input=[message]).data[0].embedding
     scored = [
         (cosine_similarity(query_embedding, chunk.embedding), chunk)
         for chunk in non_selected_chunks
@@ -110,24 +133,39 @@ User question:
     try:
         result = json.loads(payload)
     except json.JSONDecodeError as error:
-        raise HTTPException(status_code=500, detail=f"Model returned invalid JSON: {error}") from error
+        raise HTTPException(
+            status_code=500, detail=f"Model returned invalid JSON: {error}"
+        ) from error
     result.setdefault("answer", "I could not produce an answer.")
     result.setdefault("cited_chunk_ids", [])
     result.setdefault("follow_up", "")
     return result
 
 
-def save_chat_exchange(paper_id: str, user_message: str, selection_text: str, selected_chunk_ids: list[str], answer: str, cited_chunk_ids: list[str]) -> None:
+def save_chat_exchange(
+    paper_id: str,
+    user_message: str,
+    selection_text: str,
+    selected_chunk_ids: list[str],
+    answer: str,
+    cited_chunk_ids: list[str],
+) -> None:
     with get_db() as connection:
         conversation_id = get_conversation_id(connection, paper_id)
-        store_message(connection, conversation_id, "user", user_message, selected_chunk_ids, selection_text)
-        store_message(connection, conversation_id, "assistant", answer, cited_chunk_ids, selection_text)
+        store_message(
+            connection, conversation_id, "user", user_message, selected_chunk_ids, selection_text
+        )
+        store_message(
+            connection, conversation_id, "assistant", answer, cited_chunk_ids, selection_text
+        )
 
 
 def build_chat_context(paper_id: str) -> tuple[list[dict[str, str]], str]:
     with get_db() as connection:
         conversation_id = get_conversation_id(connection, paper_id)
-        return fetch_recent_messages(connection, conversation_id), summarize_highlights(connection, paper_id)
+        return fetch_recent_messages(connection, conversation_id), summarize_highlights(
+            connection, paper_id
+        )
 
 
 def build_highlight(payload: Any) -> dict[str, Any]:

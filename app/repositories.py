@@ -8,9 +8,11 @@ from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.config import PDF_DIR, SUMMARY_DIR
 from app.db import get_db
 from app.models import Conversation, Highlight, Message, Paper, PaperChunk
 from app.schemas import ParsedPaper
+from app.services.vector_store import delete_vector_index
 
 
 def _format_timestamp(value: Any) -> str | None:
@@ -144,7 +146,9 @@ def fetch_chunks(session: Session, paper_id: str) -> list[PaperChunk]:
     )
 
 
-def fetch_recent_messages(session: Session, conversation_id: str, limit: int = 10) -> list[dict[str, str]]:
+def fetch_recent_messages(
+    session: Session, conversation_id: str, limit: int = 10
+) -> list[dict[str, str]]:
     messages = list(
         session.execute(
             select(Message)
@@ -206,6 +210,21 @@ def clear_conversation_messages(paper_id: str) -> None:
             conversation.updated_at = func.current_timestamp()
 
 
+def clear_library() -> None:
+    paper_ids: list[str]
+    with get_db() as session:
+        paper_ids = list(session.execute(select(Paper.id)).scalars())
+        session.execute(delete(Paper))
+
+    for paper_id in paper_ids:
+        delete_vector_index(paper_id)
+
+    for directory in (PDF_DIR, SUMMARY_DIR):
+        for path in directory.iterdir():
+            if path.is_file():
+                path.unlink(missing_ok=True)
+
+
 def save_highlight(paper_id: str, highlight: dict[str, Any]) -> None:
     with get_db() as session:
         session.add(
@@ -252,6 +271,8 @@ def serialize_paper_detail(paper_id: str) -> dict[str, Any]:
                 }
                 for chunk in paper.chunks
             ],
-            "messages": [] if conversation is None else [_serialize_message(message) for message in conversation.messages],
+            "messages": []
+            if conversation is None
+            else [_serialize_message(message) for message in conversation.messages],
             "highlights": [_serialize_highlight(highlight) for highlight in paper.highlights],
         }

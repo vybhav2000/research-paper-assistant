@@ -22,7 +22,7 @@ class ChatRequest(BaseModel):
     message: str
     selected_chunk_ids: list[str] = []
     selection_text: str = ""
-    mode: str = "standard"
+    mode: str = "agentic"
 
 
 class HighlightRequest(BaseModel):

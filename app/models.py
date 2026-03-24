@@ -49,7 +49,9 @@ class PaperChunk(Base):
     __tablename__ = "paper_chunks"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    paper_id: Mapped[str] = mapped_column(ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True)
+    paper_id: Mapped[str] = mapped_column(
+        ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     page_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
     page_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -63,7 +65,9 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    paper_id: Mapped[str] = mapped_column(ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, unique=True)
+    paper_id: Mapped[str] = mapped_column(
+        ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
     title: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -110,7 +114,9 @@ class Highlight(Base):
     __tablename__ = "highlights"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    paper_id: Mapped[str] = mapped_column(ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True)
+    paper_id: Mapped[str] = mapped_column(
+        ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     chunk_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     label: Mapped[str] = mapped_column(Text, nullable=False)
     quote: Mapped[str] = mapped_column(Text, nullable=False)

@@ -12,9 +12,15 @@ from pypdf import PdfReader
 
 from app.config import ARXIV_API, PDF_DIR, get_settings
 from app.openai_client import get_openai_client
-from app.repositories import find_existing_paper_id, persist_paper, serialize_paper_detail, update_paper_pdf_path
+from app.repositories import (
+    find_existing_paper_id,
+    persist_paper,
+    serialize_paper_detail,
+    update_paper_pdf_path,
+)
 from app.schemas import ParsedPaper
 from app.services.paper_search_agent import search_arxiv_with_agent
+from app.services.vector_store import build_vector_index
 
 
 def normalize_query(query: str) -> str:
@@ -96,7 +102,9 @@ def extract_pdf_text(pdf_path: Path) -> list[tuple[int, str]]:
     return page_texts
 
 
-def chunk_paper_text(page_texts: list[tuple[int, str]], size: int = 1700, overlap: int = 250) -> list[dict[str, Any]]:
+def chunk_paper_text(
+    page_texts: list[tuple[int, str]], size: int = 1700, overlap: int = 250
+) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     buffer = ""
     buffer_pages: list[int] = []
@@ -123,7 +131,9 @@ def chunk_paper_text(page_texts: list[tuple[int, str]], size: int = 1700, overla
         sanitized = re.sub(r"\s+", " ", text or "").strip()
         if not sanitized:
             continue
-        paragraphs = [segment.strip() for segment in re.split(r"(?<=[.!?])\s+", sanitized) if segment.strip()]
+        paragraphs = [
+            segment.strip() for segment in re.split(r"(?<=[.!?])\s+", sanitized) if segment.strip()
+        ]
         for paragraph in paragraphs:
             candidate = f"{buffer} {paragraph}".strip() if buffer else paragraph
             if len(candidate) <= size:
@@ -161,11 +171,28 @@ def import_paper(query: str) -> dict[str, Any]:
     page_texts = extract_pdf_text(pdf_path)
     chunks = chunk_paper_text(page_texts)
     if not chunks:
-        raise HTTPException(status_code=400, detail="The PDF was fetched, but no readable text chunks were produced.")
+        raise HTTPException(
+            status_code=400,
+            detail="The PDF was fetched, but no readable text chunks were produced.",
+        )
 
     paper_id = str(uuid.uuid4())
     conversation_id = str(uuid.uuid4())
-    persist_paper(parsed, pdf_path, page_texts, embed_texts([chunk["content"] for chunk in chunks]), chunks, paper_id, conversation_id)
+    embeddings = embed_texts([chunk["content"] for chunk in chunks])
+    persist_paper(
+        parsed,
+        pdf_path,
+        page_texts,
+        embeddings,
+        chunks,
+        paper_id,
+        conversation_id,
+    )
+    build_vector_index(
+        paper_id,
+        chunks,
+        embeddings,
+    )
 
     final_path = PDF_DIR / f"{paper_id}.pdf"
     if pdf_path != final_path:

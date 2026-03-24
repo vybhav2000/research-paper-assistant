@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: research-paper-assistant
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/healthz
+    autoDeploy: true
+    disk:
+      name: app-data
+      mountPath: /app/data
+      sizeGB: 5
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: OPENAI_CHAT_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: LOG_LEVEL
+        value: INFO

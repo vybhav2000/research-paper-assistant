@@ -9,6 +9,7 @@ description = "Research paper assistant with PDF viewing, highlighting, memory, 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "chromadb>=0.5.23",
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
     "langchain-openai>=0.3.17",

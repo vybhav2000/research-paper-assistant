@@ -1,224 +1,41 @@
 from __future__ import annotations
 
 import json
-from typing import Any, TypedDict
+from typing import Any
 
 from fastapi import HTTPException
-from langgraph.graph import END, START, StateGraph
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
 
 from app.config import get_settings
 from app.logging_utils import get_logger
-from app.openai_client import get_openai_client
 from app.repositories import get_paper_or_404
-from app.services.chat import generate_answer, retrieve_relevant_chunks
+from app.services.chat import retrieve_relevant_chunks
+from app.services.tavily import tavily_search
 
 
 logger = get_logger("app.agent.chat")
-
-
-class AgentState(TypedDict, total=False):
-    paper_id: str
-    message: str
-    selection_text: str
-    selected_chunk_ids: list[str]
-    paper: Any
-    conversation_history: list[dict[str, str]]
-    highlight_summary: str
-    plan: dict[str, Any]
-    relevant_chunks: list[dict[str, Any]]
-    secondary_chunks: list[dict[str, Any]]
-    requires_second_pass: bool
-    retrieval_query: str
-    second_pass_query: str
-    answer: str
-    cited_chunk_ids: list[str]
-    follow_up: str
-    agent_steps: list[str]
 
 
 def _parse_json(payload: str) -> dict[str, Any]:
     try:
         return json.loads(payload)
     except json.JSONDecodeError as error:
-        raise HTTPException(status_code=500, detail=f"Agent returned invalid JSON: {error}") from error
+        raise HTTPException(
+            status_code=500, detail=f"Agent returned invalid JSON: {error}"
+        ) from error
 
 
-def _append_step(state: AgentState, message: str) -> list[str]:
-    steps = list(state.get("agent_steps", []))
-    steps.append(message)
-    logger.info("chat_agent_step | paper_id=%s | %s", state.get("paper_id", "unknown"), message)
-    return steps
-
-
-def plan_question(state: AgentState) -> AgentState:
-    paper = state["paper"]
-    system_prompt = (
-        "You are planning a research assistant workflow for a single paper. "
-        "Return valid JSON with keys: retrieval_query, analysis_goal, needs_second_pass, second_pass_query, user_intent. "
-        "Keep retrieval_query concise and optimized for semantic retrieval over the paper text. "
-        "Only request a second pass when the question likely requires extra context from distant parts of the paper."
-    )
-    user_prompt = f"""
-Paper title: {paper.title}
-Abstract: {paper.abstract}
-User selection:
-{state["selection_text"] or "No explicit selection."}
-
-User question:
-{state["message"]}
-""".strip()
-
-    completion = get_openai_client().chat.completions.create(
-        model=get_settings().chat_model,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    plan = _parse_json(completion.choices[0].message.content or "{}")
-    plan.setdefault("retrieval_query", state["message"])
-    plan.setdefault("analysis_goal", "Answer the user precisely using the paper.")
-    plan.setdefault("needs_second_pass", False)
-    plan.setdefault("second_pass_query", state["message"])
-    plan.setdefault("user_intent", "paper_qa")
-
-    return {
-        "plan": plan,
-        "retrieval_query": f"{state['selection_text']}\n{plan['retrieval_query']}".strip(),
-        "requires_second_pass": bool(plan["needs_second_pass"]),
-        "second_pass_query": plan["second_pass_query"],
-        "agent_steps": _append_step(
-            state,
-            f"Planned workflow for intent '{plan['user_intent']}' with goal: {plan['analysis_goal']}",
-        ),
-    }
-
-
-def retrieve_primary_context(state: AgentState) -> AgentState:
-    chunks = retrieve_relevant_chunks(
-        state["paper_id"],
-        state["retrieval_query"],
-        state["selected_chunk_ids"],
-        top_k=8,
-    )
-    return {
-        "relevant_chunks": chunks,
-        "agent_steps": _append_step(state, f"Retrieved {len(chunks)} primary context chunks."),
-    }
-
-
-def evaluate_context(state: AgentState) -> AgentState:
-    if not state.get("requires_second_pass"):
-        return {"agent_steps": _append_step(state, "Primary context judged sufficient for synthesis.")}
-
-    system_prompt = (
-        "You are checking whether a second retrieval pass is useful for answering a paper question. "
-        "Return valid JSON with keys: second_pass_needed, refined_query, rationale. "
-        "Prefer false unless the current context obviously misses comparison, limitations, setup, or results details."
-    )
-    joined_context = "\n\n".join(chunk["content"] for chunk in state.get("relevant_chunks", []))
-    user_prompt = f"""
-User question:
-{state["message"]}
-
-Current retrieval plan:
-{json.dumps(state["plan"])}
-
-Current context:
-{joined_context[:6000]}
-""".strip()
-    completion = get_openai_client().chat.completions.create(
-        model=get_settings().chat_model,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    review = _parse_json(completion.choices[0].message.content or "{}")
-    review.setdefault("second_pass_needed", False)
-    review.setdefault("refined_query", state.get("second_pass_query", state["message"]))
-    review.setdefault("rationale", "No extra retrieval needed.")
-
-    return {
-        "requires_second_pass": bool(review["second_pass_needed"]),
-        "second_pass_query": review["refined_query"],
-        "agent_steps": _append_step(state, f"Reviewed context sufficiency: {review['rationale']}"),
-    }
-
-
-def retrieve_secondary_context(state: AgentState) -> AgentState:
-    chunks = retrieve_relevant_chunks(
-        state["paper_id"],
-        f"{state['selection_text']}\n{state['second_pass_query']}".strip(),
-        state["selected_chunk_ids"],
-        top_k=6,
-    )
-    primary_ids = {chunk["id"] for chunk in state.get("relevant_chunks", [])}
-    secondary = [chunk for chunk in chunks if chunk["id"] not in primary_ids]
-    merged = list(state.get("relevant_chunks", [])) + secondary
-    return {
-        "secondary_chunks": secondary,
-        "relevant_chunks": merged[:12],
-        "agent_steps": _append_step(state, f"Ran secondary retrieval and added {len(secondary)} new chunks."),
-    }
-
-
-def synthesize_answer(state: AgentState) -> AgentState:
-    result = generate_answer(
-        paper=state["paper"],
-        conversation_history=state["conversation_history"],
-        message=state["message"],
-        relevant_chunks=state["relevant_chunks"],
-        selection_text=state["selection_text"],
-        highlight_summary=state["highlight_summary"],
-    )
-    cited_chunk_ids = [
-        chunk_id
-        for chunk_id in result["cited_chunk_ids"]
-        if any(chunk["id"] == chunk_id for chunk in state["relevant_chunks"])
-    ]
-    return {
-        "answer": result["answer"],
-        "cited_chunk_ids": cited_chunk_ids,
-        "follow_up": result["follow_up"],
-        "agent_steps": _append_step(
-            state,
-            f"Synthesized final answer from {len(state['relevant_chunks'])} supporting chunks.",
-        ),
-    }
-
-
-def should_run_second_pass(state: AgentState) -> str:
-    return "second_pass" if state.get("requires_second_pass") else "synthesize"
-
-
-def build_agent_graph():
-    graph = StateGraph(AgentState)
-    graph.add_node("plan", plan_question)
-    graph.add_node("retrieve_primary", retrieve_primary_context)
-    graph.add_node("evaluate", evaluate_context)
-    graph.add_node("second_pass", retrieve_secondary_context)
-    graph.add_node("synthesize", synthesize_answer)
-
-    graph.add_edge(START, "plan")
-    graph.add_edge("plan", "retrieve_primary")
-    graph.add_edge("retrieve_primary", "evaluate")
-    graph.add_conditional_edges(
-        "evaluate",
-        should_run_second_pass,
-        {
-            "second_pass": "second_pass",
-            "synthesize": "synthesize",
-        },
-    )
-    graph.add_edge("second_pass", "synthesize")
-    graph.add_edge("synthesize", END)
-    return graph.compile()
-
-
-AGENT_GRAPH = build_agent_graph()
+def _extract_final_json(messages: list[Any]) -> dict[str, Any]:
+    for message in reversed(messages):
+        content = getattr(message, "content", "")
+        if isinstance(content, str) and content.strip():
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                continue
+    raise HTTPException(status_code=500, detail="Chat agent did not return valid JSON.")
 
 
 def run_agentic_research_chat(
@@ -236,28 +53,102 @@ def run_agentic_research_chat(
         message,
     )
     paper = get_paper_or_404(paper_id)
-    final_state = AGENT_GRAPH.invoke(
-        {
-            "paper_id": paper_id,
-            "message": message,
-            "selection_text": selection_text,
-            "selected_chunk_ids": selected_chunk_ids,
-            "paper": paper,
-            "conversation_history": conversation_history,
-            "highlight_summary": highlight_summary,
-            "agent_steps": [],
-        }
+    seen_chunks: dict[str, dict[str, Any]] = {}
+    external_sources: list[dict[str, str]] = []
+    agent_steps: list[str] = []
+
+    def log_step(step: str) -> None:
+        agent_steps.append(step)
+        logger.info("chat_agent_step | paper_id=%s | %s", paper_id, step)
+
+    @tool
+    def retrieve_paper_context(query_text: str) -> str:
+        """Retrieve the most relevant chunks from the imported paper for a focused question."""
+        chunks = retrieve_relevant_chunks(
+            paper_id,
+            f"{selection_text}\n{query_text}".strip(),
+            selected_chunk_ids,
+            top_k=8,
+        )
+        for chunk in chunks:
+            seen_chunks[chunk["id"]] = chunk
+        log_step(f"Retrieved {len(chunks)} paper chunks for query: {query_text}")
+        return json.dumps(chunks)
+
+    @tool
+    def read_chunk(chunk_id: str) -> str:
+        """Read one previously retrieved chunk in full by its chunk id."""
+        chunk = seen_chunks.get(chunk_id)
+        if chunk is None:
+            return json.dumps({"found": False, "chunk_id": chunk_id})
+        log_step(f"Reviewed chunk {chunk_id} on pages {chunk['page_start']}-{chunk['page_end']}")
+        return json.dumps({"found": True, "chunk": chunk})
+
+    @tool
+    def search_web(query_text: str) -> str:
+        """Search the web with Tavily when the user asks for external context, comparisons, or broader background."""
+        result = tavily_search(query_text)
+        results = result.get("results", [])
+        external_sources[:] = [
+            {"title": item.get("title", ""), "url": item.get("url", "")} for item in results
+        ]
+        if result.get("available"):
+            log_step(f"Ran Tavily search for external context: {query_text}")
+        else:
+            log_step("Skipped Tavily search because TAVILY_API_KEY is not configured.")
+        return json.dumps(result)
+
+    model = ChatOpenAI(
+        model=get_settings().chat_model,
+        api_key=get_settings().openai_api_key,
+        temperature=0,
     )
+    agent = create_react_agent(
+        model=model,
+        tools=[retrieve_paper_context, read_chunk, search_web],
+        prompt=(
+            "You are an agentic research-paper assistant for one imported paper. "
+            "You must call retrieve_paper_context before answering any paper question. "
+            "Call read_chunk when you need to inspect a specific chunk more closely. "
+            "Use search_web only when the user asks for external comparisons, background, related work, or web search. "
+            "Prefer the paper itself whenever possible. "
+            "Return final output as valid JSON with keys: answer_markdown, cited_chunk_ids, follow_up, used_external_search. "
+            "The answer_markdown field must be markdown, concise but complete, and grounded in the tool results. "
+            "The cited_chunk_ids array must only include ids from retrieved paper chunks."
+        ),
+    )
+    message_history = [(item["role"], item["content"]) for item in conversation_history]
+    user_prompt = (
+        f"Paper title: {paper.title}\n"
+        f"Authors: {', '.join(paper.authors)}\n"
+        f"Abstract: {paper.abstract}\n\n"
+        f"Saved highlights:\n{highlight_summary}\n\n"
+        f"Selected text:\n{selection_text or 'No explicit selection.'}\n\n"
+        f"User request:\n{message}"
+    )
+    result = agent.invoke({"messages": [*message_history, ("user", user_prompt)]})
+    for item in result["messages"]:
+        message_type = getattr(item, "type", item.__class__.__name__)
+        content = getattr(item, "content", "")
+        preview = content if isinstance(content, str) else json.dumps(content)
+        logger.info("chat_agent_message | type=%s | content=%s", message_type, preview[:1200])
+
+    payload = _extract_final_json(result["messages"])
+    cited_chunk_ids = [
+        chunk_id for chunk_id in payload.get("cited_chunk_ids", []) if chunk_id in seen_chunks
+    ]
+    context = [seen_chunks[chunk_id] for chunk_id in cited_chunk_ids]
     logger.info(
-        "chat_agent_complete | paper_id=%s | citations=%s | follow_up=%s",
+        "chat_agent_complete | paper_id=%s | citations=%s | external=%s",
         paper_id,
-        len(final_state["cited_chunk_ids"]),
-        bool(final_state["follow_up"]),
+        len(cited_chunk_ids),
+        bool(payload.get("used_external_search")),
     )
     return {
-        "answer": final_state["answer"],
-        "citations": final_state["cited_chunk_ids"],
-        "follow_up": final_state["follow_up"],
-        "context": final_state["relevant_chunks"],
-        "agent_steps": final_state.get("agent_steps", []),
+        "answer": payload.get("answer_markdown", "I could not produce an answer."),
+        "citations": cited_chunk_ids,
+        "follow_up": payload.get("follow_up", ""),
+        "context": context,
+        "agent_steps": agent_steps,
+        "external_sources": external_sources,
     }

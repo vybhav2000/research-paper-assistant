@@ -11,16 +11,20 @@ const els = {
   paperQuery: document.getElementById("paper-query"),
   paperList: document.getElementById("paper-list"),
   paperCount: document.getElementById("paper-count"),
+  clearLibrary: document.getElementById("clear-library"),
   heroPanel: document.getElementById("hero-panel"),
   paperMeta: document.getElementById("paper-meta"),
   workspaceGrid: document.getElementById("workspace-grid"),
   pdfFrame: document.getElementById("pdf-frame"),
   sourceLink: document.getElementById("source-link"),
+  summaryPanel: document.getElementById("summary-panel"),
+  summaryStatus: document.getElementById("summary-status"),
+  createSummary: document.getElementById("create-summary"),
+  paperSummary: document.getElementById("paper-summary"),
   chatMessages: document.getElementById("chat-messages"),
   chatForm: document.getElementById("chat-form"),
   chatInput: document.getElementById("chat-input"),
   chatMode: document.getElementById("chat-mode"),
-  chatEngine: document.getElementById("chat-engine"),
   clearChat: document.getElementById("clear-chat"),
   highlightList: document.getElementById("highlight-list"),
   clearFocus: document.getElementById("clear-focus"),
@@ -43,8 +47,9 @@ async function request(path, options = {}) {
 
 function renderLibrary() {
   els.paperCount.textContent = `${state.papers.length} paper${state.papers.length === 1 ? "" : "s"}`;
+  els.clearLibrary.disabled = !state.papers.length;
   if (!state.papers.length) {
-    els.paperList.innerHTML = `<div class="empty-state">No papers yet.</div>`;
+    els.paperList.innerHTML = `<div class="empty-state">No papers yet. Import an arXiv paper to build a workspace.</div>`;
     return;
   }
   els.paperList.innerHTML = state.papers.map((paper) => `
@@ -62,8 +67,7 @@ function renderLibrary() {
 function updateSelectionUi() {
   const count = state.selectedChunkIds.size;
   const scope = count ? "Highlight focus" : "Whole paper";
-  const engine = els.chatEngine.value === "agentic" ? "Agentic" : "Standard";
-  els.chatMode.textContent = `${scope} | ${engine}`;
+  els.chatMode.textContent = `${scope} | Agentic`;
 }
 
 function renderAgentSteps(steps = []) {
@@ -76,10 +80,116 @@ function renderAgentSteps(steps = []) {
   els.agentSteps.innerHTML = steps.map((step) => `<div class="agent-step">${step}</div>`).join("");
 }
 
+function escapeHtml(value) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function applyInlineMarkdown(value) {
+  return value
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+}
+
+function renderMarkdown(markdown = "") {
+  const lines = escapeHtml(markdown).split("\n");
+  const html = [];
+  let inList = false;
+  let inCodeBlock = false;
+  let codeBuffer = [];
+
+  const closeList = () => {
+    if (inList) {
+      html.push("</ul>");
+      inList = false;
+    }
+  };
+
+  const closeCodeBlock = () => {
+    if (inCodeBlock) {
+      html.push(`<pre><code>${codeBuffer.join("\n")}</code></pre>`);
+      inCodeBlock = false;
+      codeBuffer = [];
+    }
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    if (line.startsWith("```")) {
+      closeList();
+      if (inCodeBlock) {
+        closeCodeBlock();
+      } else {
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      codeBuffer.push(line);
+      continue;
+    }
+    if (!line.trim()) {
+      closeList();
+      html.push("");
+      continue;
+    }
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      closeList();
+      const level = headingMatch[1].length;
+      html.push(`<h${level}>${applyInlineMarkdown(headingMatch[2])}</h${level}>`);
+      continue;
+    }
+    const listMatch = line.match(/^[-*]\s+(.*)$/);
+    if (listMatch) {
+      if (!inList) {
+        html.push("<ul>");
+        inList = true;
+      }
+      html.push(`<li>${applyInlineMarkdown(listMatch[1])}</li>`);
+      continue;
+    }
+    closeList();
+    html.push(`<p>${applyInlineMarkdown(line)}</p>`);
+  }
+
+  closeList();
+  closeCodeBlock();
+  return html.join("");
+}
+
+function renderMath(container) {
+  if (!container || typeof window.renderMathInElement !== "function") return;
+  window.renderMathInElement(container, {
+    delimiters: [
+      { left: "$$", right: "$$", display: true },
+      { left: "\\(", right: "\\)", display: false },
+      { left: "\\[", right: "\\]", display: true },
+    ],
+    throwOnError: false,
+  });
+}
+
+function renderSummary(summaryMarkdown = "", status = "Ready") {
+  els.summaryStatus.textContent = status;
+  if (!summaryMarkdown) {
+    els.paperSummary.innerHTML = `<div class="empty-state">No summary yet. Create one only when you need it.</div>`;
+    return;
+  }
+  els.paperSummary.innerHTML = renderMarkdown(summaryMarkdown);
+  renderMath(els.paperSummary);
+}
+
 function renderMessages() {
   const messages = state.activePaper?.messages || [];
   if (!messages.length) {
-    els.chatMessages.innerHTML = `<div class="empty-state">Ask a question about the paper, or click a saved highlight to use it as chat focus.</div>`;
+    els.chatMessages.innerHTML = `<div class="empty-state">Ask a follow-up about the summary or click a saved highlight to focus the agent on a specific part of the paper.</div>`;
     return;
   }
   els.chatMessages.innerHTML = "";
@@ -88,7 +198,8 @@ function renderMessages() {
     const root = fragment.querySelector(".message");
     root.classList.add(message.role);
     fragment.querySelector(".message-role").textContent = message.role === "assistant" ? "Assistant" : "You";
-    fragment.querySelector(".message-content").textContent = message.content;
+    fragment.querySelector(".message-content").innerHTML = renderMarkdown(message.content);
+    renderMath(fragment.querySelector(".message-content"));
     const citations = message.citations?.length ? `Cites ${message.citations.length} chunk${message.citations.length === 1 ? "" : "s"}` : (message.selection_text ? "Selection-aware" : "");
     fragment.querySelector(".message-meta").textContent = citations;
     els.chatMessages.appendChild(fragment);
@@ -136,11 +247,38 @@ function showWorkspace() {
   els.workspaceGrid.classList.remove("hidden");
 }
 
+function showHeroState() {
+  els.heroPanel.classList.remove("hidden");
+  els.paperMeta.classList.add("hidden");
+  els.workspaceGrid.classList.add("hidden");
+}
+
+function resetWorkspaceState() {
+  state.papers = [];
+  state.activePaper = null;
+  state.selectedChunkIds = new Set();
+  state.activeCitations = new Set();
+  els.paperMeta.innerHTML = "";
+  els.pdfFrame.src = "";
+  els.sourceLink.href = "#";
+  renderAgentSteps([]);
+  renderSummary("", "Not created");
+  renderMessages();
+  renderHighlights();
+  updateSelectionUi();
+  renderLibrary();
+  showHeroState();
+}
+
 async function refreshLibrary(activePaperId = state.activePaper?.id) {
   state.papers = await request("/api/papers");
   renderLibrary();
   if (activePaperId) {
     await loadPaper(activePaperId);
+    return;
+  }
+  if (!state.papers.length) {
+    resetWorkspaceState();
   }
 }
 
@@ -149,6 +287,7 @@ async function loadPaper(paperId) {
   state.selectedChunkIds = new Set();
   state.activeCitations = new Set();
   renderAgentSteps([]);
+  renderSummary("", "Checking");
   renderLibrary();
   renderPaperMeta();
   els.pdfFrame.src = `${state.activePaper.pdf_url}#toolbar=1&navpanes=0&view=FitH`;
@@ -157,6 +296,16 @@ async function loadPaper(paperId) {
   renderHighlights();
   updateSelectionUi();
   showWorkspace();
+  try {
+    const summary = await request(`/api/papers/${paperId}/summary`);
+    if (summary.summary_exists && summary.summary_markdown) {
+      renderSummary(summary.summary_markdown, "Ready");
+    } else {
+      renderSummary("", "Not created");
+    }
+  } catch (error) {
+    renderSummary(`## Summary unavailable\n\n${error.message}`, "Error");
+  }
 }
 
 function appendTemporaryMessage(role, content) {
@@ -206,7 +355,6 @@ els.chatForm.addEventListener("submit", async (event) => {
         message,
         selected_chunk_ids: selectedChunkIds,
         selection_text: selectionText,
-        mode: els.chatEngine.value,
       }),
     });
     const paper = await request(`/api/papers/${state.activePaper.id}`);
@@ -229,10 +377,34 @@ els.clearFocus.addEventListener("click", () => {
   updateSelectionUi();
 });
 
-els.chatEngine.addEventListener("change", () => {
-  updateSelectionUi();
-  if (els.chatEngine.value !== "agentic") {
-    renderAgentSteps([]);
+els.clearLibrary.addEventListener("click", async () => {
+  if (!state.papers.length) return;
+  const confirmed = window.confirm("Clear the full library, including imported PDFs, summaries, chat history, and highlights?");
+  if (!confirmed) return;
+  els.clearLibrary.disabled = true;
+  try {
+    await request("/api/papers", { method: "DELETE" });
+    els.importStatus.textContent = "Library cleared.";
+    resetWorkspaceState();
+  } catch (error) {
+    els.importStatus.textContent = error.message || "Failed to clear library.";
+    renderLibrary();
+  }
+});
+
+els.createSummary.addEventListener("click", async () => {
+  if (!state.activePaper) return;
+  els.createSummary.disabled = true;
+  renderSummary("", "Creating");
+  try {
+    const summary = await request(`/api/papers/${state.activePaper.id}/summary`, {
+      method: "POST",
+    });
+    renderSummary(summary.summary_markdown, "Ready");
+  } catch (error) {
+    renderSummary(`## Summary unavailable\n\n${error.message}`, "Error");
+  } finally {
+    els.createSummary.disabled = false;
   }
 });
 
