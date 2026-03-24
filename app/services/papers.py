@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
@@ -11,6 +12,7 @@ from fastapi import HTTPException
 from pypdf import PdfReader
 
 from app.config import ARXIV_API, PDF_DIR, get_settings
+from app.logging_utils import get_logger
 from app.openai_client import get_openai_client
 from app.repositories import (
     find_existing_paper_id,
@@ -21,6 +23,9 @@ from app.repositories import (
 from app.schemas import ParsedPaper
 from app.services.paper_search_agent import search_arxiv_with_agent
 from app.services.vector_store import build_vector_index
+
+
+logger = get_logger("app.papers")
 
 
 def normalize_query(query: str) -> str:
@@ -46,6 +51,103 @@ def extract_arxiv_id(query: str) -> str:
     return cleaned
 
 
+def _entry_to_parsed_paper(entry: ElementTree.Element, namespace: dict[str, str]) -> ParsedPaper:
+    title = (entry.findtext("atom:title", default="", namespaces=namespace) or "").strip()
+    abstract = (entry.findtext("atom:summary", default="", namespaces=namespace) or "").strip()
+    authors = [
+        author.findtext("atom:name", default="", namespaces=namespace).strip()
+        for author in entry.findall("atom:author", namespace)
+    ]
+    source_url = entry.findtext("atom:id", default="", namespaces=namespace).strip()
+    pdf_url = ""
+    for link in entry.findall("atom:link", namespace):
+        if link.attrib.get("title") == "pdf":
+            pdf_url = link.attrib.get("href", "").strip()
+            break
+    if not pdf_url and source_url:
+        pdf_url = source_url.replace("/abs/", "/pdf/") + ".pdf"
+    return ParsedPaper(
+        title=title,
+        authors=[author for author in authors if author],
+        abstract=abstract,
+        source_url=source_url,
+        pdf_url=pdf_url,
+    )
+
+
+def _search_arxiv_candidates(query: str, max_results: int = 5) -> list[ParsedPaper]:
+    namespace = {"atom": "http://www.w3.org/2005/Atom"}
+    deduped: dict[str, ParsedPaper] = {}
+    params_list = [
+        {"search_query": f'ti:"{query}"', "start": 0, "max_results": max_results},
+        {"search_query": f'all:"{query}"', "start": 0, "max_results": max_results},
+    ]
+
+    with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        for params in params_list:
+            response = client.get(ARXIV_API, params=params)
+            if response.status_code >= 400:
+                logger.warning(
+                    "arxiv_search_variant_failed | query=%s | search_query=%s | status=%s",
+                    query,
+                    params["search_query"],
+                    response.status_code,
+                )
+                continue
+            xml_root = ElementTree.fromstring(response.text)
+            for entry in xml_root.findall("atom:entry", namespace):
+                candidate = _entry_to_parsed_paper(entry, namespace)
+                if candidate.source_url and candidate.source_url not in deduped:
+                    deduped[candidate.source_url] = candidate
+    return list(deduped.values())
+
+
+def _canonicalize_title(value: str) -> str:
+    lowered = value.casefold()
+    lowered = re.sub(r"[^a-z0-9\s]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _title_match_score(query: str, candidate_title: str) -> float:
+    canonical_query = _canonicalize_title(query)
+    canonical_title = _canonicalize_title(candidate_title)
+    if not canonical_query or not canonical_title:
+        return 0.0
+    if canonical_query == canonical_title:
+        return 1.0
+    if canonical_title.startswith(canonical_query) or canonical_query in canonical_title:
+        return 0.97
+
+    query_tokens = set(canonical_query.split())
+    title_tokens = set(canonical_title.split())
+    token_overlap = len(query_tokens & title_tokens) / max(len(query_tokens), 1)
+    sequence_score = SequenceMatcher(None, canonical_query, canonical_title).ratio()
+    return max(sequence_score, token_overlap)
+
+
+def _search_arxiv_fast(query: str) -> ParsedPaper | None:
+    candidates = _search_arxiv_candidates(query)
+    if not candidates:
+        return None
+
+    ranked = sorted(
+        ((candidate, _title_match_score(query, candidate.title)) for candidate in candidates),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    best_candidate, best_score = ranked[0]
+    logger.info(
+        "arxiv_fast_search_ranked | query=%s | best_title=%s | best_score=%.3f | candidates=%s",
+        query,
+        best_candidate.title,
+        best_score,
+        len(ranked),
+    )
+    if best_score >= 0.92:
+        return best_candidate
+    return None
+
+
 def search_arxiv(query: str) -> ParsedPaper:
     if is_arxiv_reference(query):
         params = {"search_query": f"id:{extract_arxiv_id(query)}", "start": 0, "max_results": 1}
@@ -57,27 +159,11 @@ def search_arxiv(query: str) -> ParsedPaper:
         entry = xml_root.find("atom:entry", namespace)
         if entry is None:
             raise HTTPException(status_code=404, detail="No matching paper found on arXiv.")
-        title = (entry.findtext("atom:title", default="", namespaces=namespace) or "").strip()
-        abstract = (entry.findtext("atom:summary", default="", namespaces=namespace) or "").strip()
-        authors = [
-            author.findtext("atom:name", default="", namespaces=namespace).strip()
-            for author in entry.findall("atom:author", namespace)
-        ]
-        source_url = entry.findtext("atom:id", default="", namespaces=namespace).strip()
-        pdf_url = ""
-        for link in entry.findall("atom:link", namespace):
-            if link.attrib.get("title") == "pdf":
-                pdf_url = link.attrib.get("href", "").strip()
-                break
-        if not pdf_url and source_url:
-            pdf_url = source_url.replace("/abs/", "/pdf/") + ".pdf"
-        return ParsedPaper(
-            title=title,
-            authors=[author for author in authors if author],
-            abstract=abstract,
-            source_url=source_url,
-            pdf_url=pdf_url,
-        )
+        return _entry_to_parsed_paper(entry, namespace)
+    fast_match = _search_arxiv_fast(query)
+    if fast_match is not None:
+        return fast_match
+    logger.info("arxiv_fast_search_fallback_to_agent | query=%s", query)
     return search_arxiv_with_agent(query)
 
 

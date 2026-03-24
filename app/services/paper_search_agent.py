@@ -85,9 +85,11 @@ def _extract_final_json(messages: list[Any]) -> dict[str, Any]:
         content = getattr(message, "content", "")
         if isinstance(content, str) and content.strip():
             try:
-                return json.loads(content)
+                payload = json.loads(content)
             except json.JSONDecodeError:
                 continue
+            if isinstance(payload, dict):
+                return payload
     raise HTTPException(status_code=500, detail="Search agent did not return valid JSON.")
 
 
@@ -98,18 +100,36 @@ def search_arxiv_with_agent(query: str) -> ParsedPaper:
 
     logger.info("paper_search_agent_start | query=%s", query)
     seen_candidates: dict[str, dict[str, Any]] = {}
+    latest_candidates: list[dict[str, Any]] = []
+    search_calls = 0
 
     @tool
     def search_arxiv(query_text: str) -> str:
-        """Search arXiv for candidate papers matching a user request. Use this repeatedly with refined queries."""
+        """Search arXiv for candidate papers matching a user request. You may call this at most twice total."""
+        nonlocal latest_candidates, search_calls
+        if search_calls >= 2:
+            logger.info(
+                "paper_search_tool_limit_reached | tool=search_arxiv | query=%s", query_text
+            )
+            return json.dumps(
+                {
+                    "limit_reached": True,
+                    "message": "You already used your maximum of 2 search calls.",
+                    "candidates": latest_candidates,
+                }
+            )
+
+        search_calls += 1
         logger.info("paper_search_tool_call | tool=search_arxiv | query=%s", query_text)
         candidates = _search_candidates(query_text)
+        latest_candidates = candidates
         for candidate in candidates:
             seen_candidates[candidate["source_url"]] = candidate
         logger.info(
-            "paper_search_tool_result | tool=search_arxiv | query=%s | candidates=%s",
+            "paper_search_tool_result | tool=search_arxiv | query=%s | candidates=%s | search_calls=%s",
             query_text,
             len(candidates),
+            search_calls,
         )
         return json.dumps(candidates)
 
@@ -140,17 +160,21 @@ def search_arxiv_with_agent(query: str) -> ParsedPaper:
         prompt=(
             "You are a ReAct paper-search agent. "
             "Your job is to find the exact arXiv paper the user asked for. "
-            "You must use the search_arxiv tool first. "
-            "If results look wrong, refine the query yourself and call search_arxiv again. "
+            "You must use the search_arxiv tool first with the user's query. "
+            "You may make at most one additional search_arxiv call with a refined query. "
+            "Do not make more than 2 total search_arxiv calls. "
             "When you believe you found the correct paper, call get_candidate_by_url to confirm it. "
-            "Be strict about exactness. If you are not confident, do not guess. "
+            "If the results still do not match well, you must still return the top result from the best available result list instead of failing. "
             "Your final answer must be valid JSON with keys: "
-            "match_found, source_url, reason. "
-            "Set match_found to true only when the paper clearly matches the user's request."
+            "source_url, reason. "
+            "The source_url must come from one of the returned candidates whenever any candidates exist."
         ),
     )
 
-    result = agent.invoke({"messages": [("user", f"Find this paper on arXiv: {query}")]})
+    result = agent.invoke(
+        {"messages": [("user", f"Find this paper on arXiv: {query}")]},
+        config={"recursion_limit": 6},
+    )
     for message in result["messages"]:
         message_type = getattr(message, "type", message.__class__.__name__)
         content = getattr(message, "content", "")
@@ -159,21 +183,22 @@ def search_arxiv_with_agent(query: str) -> ParsedPaper:
             "paper_search_agent_message | type=%s | content=%s", message_type, preview[:1200]
         )
     final_payload = _extract_final_json(result["messages"])
-    if not final_payload.get("match_found"):
-        reason = final_payload.get("reason") or "No confident paper match was found."
-        logger.warning("paper_search_agent_no_match | query=%s | reason=%s", query, reason)
+    source_url = final_payload.get("source_url", "").strip()
+    candidate = seen_candidates.get(source_url) if source_url else None
+    if candidate is None and latest_candidates:
+        candidate = latest_candidates[0]
+        source_url = candidate["source_url"]
+        logger.warning(
+            "paper_search_agent_fallback_top_result | query=%s | source_url=%s | title=%s",
+            query,
+            source_url,
+            candidate["title"],
+        )
+    if candidate is None:
+        reason = final_payload.get("reason") or "No arXiv candidates were returned."
+        logger.warning("paper_search_agent_no_candidates | query=%s | reason=%s", query, reason)
         raise HTTPException(
             status_code=404, detail=f"{reason} Try a more exact title or a direct arXiv URL."
-        )
-    source_url = final_payload.get("source_url", "").strip()
-    candidate = seen_candidates.get(source_url)
-    if not candidate:
-        logger.error(
-            "paper_search_agent_invalid_selection | query=%s | source_url=%s", query, source_url
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="Search agent selected a paper that was not present in tool results.",
         )
 
     logger.info(

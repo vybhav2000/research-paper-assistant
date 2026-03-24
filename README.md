@@ -60,10 +60,3 @@ Recommended setup:
    - `OPENAI_API_KEY`
    - `TAVILY_API_KEY` if you want web search enabled
 5. Deploy.
-
-Notes:
-
-- The included [`Dockerfile`](./Dockerfile) is production-oriented for Render and no longer uses `--reload`.
-- The health check path is `GET /api/healthz`.
-- Persistent storage is required because the app stores SQLite data, PDFs, summaries, and vector indexes under `/app/data`.
-- Keep this service single-instance. Render persistent disks are attached to only one running instance at a time.
